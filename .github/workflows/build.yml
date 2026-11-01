@@ -23,7 +23,7 @@ jobs:
 
       - name: Compile
         shell: pwsh
-        run: cl /nologo /std:c++17 /EHsc /O2 /LD /I reshade-src\include /I reshade-src\deps\imgui compass_probe.cpp /Fe:compass_probe.dll
+        run: cl /nologo /std:c++17 /EHsc /O2 /LD /I reshade-src\include /I reshade-src\deps\imgui compass_probe.cpp /Fe:compass_probe.dll user32.lib
 
       - name: Rename to .addon64
         shell: pwsh
