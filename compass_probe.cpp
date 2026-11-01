@@ -1,18 +1,20 @@
-// compass_probe.cpp  (v3)
+// compass_probe.cpp  (v4)
 // ReShade add-on: find where Roblox Studio keeps the camera in its D3D11
-// constant buffers.
+// buffers.
 //
 // How it works
-//   * It watches every constant buffer upload.
+//   * It watches every buffer upload.
 //   * Hold the camera still in state A and press Ctrl+Shift+F7 (2.5 s capture),
 //     put the camera in state B and press Ctrl+Shift+F8, then press
 //     Ctrl+Shift+F9: a report is written next to the Studio exe listing the
-//     values that were stable inside each state but different between A and B.
+//     values whose range in state A does not overlap their range in state B,
+//     plus a census of every buffer that was written.
 //   * Beeps confirm each step, so the ReShade overlay is not required.
-//   * The old "search for the camera position" feature is still here.
+//
+// v4 changes: range-based comparison (tolerates jitter), tracks all buffer
+// types up to 64 KB (not only constant buffers), census + skip counters.
 //
 // Build: x64 DLL, C++17 -> compass_probe.addon64 (see build.yml)
-// NOTE: not compiled by the author; event signatures were checked against the
 
 #define _CRT_SECURE_NO_WARNINGS
 #define WIN32_LEAN_AND_MEAN
@@ -40,7 +42,7 @@ using namespace reshade::api;
 
 extern "C" __declspec(dllexport) const char *NAME = "Roblox camera probe";
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
-    "Finds the camera data inside Studio's constant buffers (A/B diff).";
+    "Finds the camera data inside Studio's buffers (A/B diff).";
 
 // ---------------------------------------------------------------------------
 // Hotkeys: hold Ctrl+Shift, then press the F-key
@@ -48,7 +50,8 @@ extern "C" __declspec(dllexport) const char *DESCRIPTION =
 static const int       KEY_CAPTURE_A = VK_F7;
 static const int       KEY_CAPTURE_B = VK_F8;
 static const int       KEY_SAVE_DIFF = VK_F9;
-static const ULONGLONG CAPTURE_MS    = 2500;   // length of one capture
+static const ULONGLONG CAPTURE_MS    = 2500;     // length of one capture
+static const uint64_t  SCAN_CAP      = 65536;    // writes bigger than this are skipped
 
 // ---------------------------------------------------------------------------
 // Settings (editable in the overlay if you can reach it)
@@ -57,15 +60,19 @@ static struct {
     float pos[3]  = { -1.080f, 6.822f, 25.367f };  // camera position in state A
     float posB[3] = { -3.080f, 6.822f, 23.367f };  // camera position in state B
     float tol = 0.01f;
-    bool  cb_only = true;
+    bool  cb_only = false;         // false = look at every buffer type
     bool  group_by_size = false;   // merge all buffers of the same size
 } S;
 
-static std::atomic<uint64_t> g_writes{ 0 };
+static std::atomic<uint64_t> g_writes{ 0 };        // writes that were scanned
+static std::atomic<uint64_t> g_seen{ 0 };          // all buffer writes seen
+static std::atomic<uint64_t> g_skip_big{ 0 };      // skipped: bigger than SCAN_CAP
+static std::atomic<uint64_t> g_skip_notcb{ 0 };    // skipped: not a constant buffer (cb_only)
+static std::atomic<uint64_t> g_max_size{ 0 };      // largest write size seen
 static std::string g_status = "Idle. Hotkeys: Ctrl+Shift+F7 = capture A, F8 = capture B, F9 = save diff.";
 
 // ---------------------------------------------------------------------------
-// Part 1: position search (same as before)
+// Part 1: position search
 // ---------------------------------------------------------------------------
 struct Hit {
     uint64_t count = 0;
@@ -119,13 +126,17 @@ static void search_position(const resource_desc &desc, uint64_t base, const floa
 // ---------------------------------------------------------------------------
 // Part 2: A/B capture and diff
 // ---------------------------------------------------------------------------
-struct Loc {                       // one float inside one buffer
-    float first = 0.f;
-    bool  seen = false;
-    bool  varying = false;         // changed during this capture
+struct Loc {                       // one float inside one buffer: range seen during a capture
+    float mn = 0.f, mx = 0.f;
+    double sum = 0.0;
+    uint32_t n = 0;
+    float mean() const { return n ? static_cast<float>(sum / n) : 0.f; }
+    float width() const { return mx - mn; }
 };
 struct BufTrack {
     uint64_t size = 0;
+    uint64_t writes = 0, via_map = 0, via_update = 0;
+    std::string info;              // usage flags + heap
     std::vector<Loc> locs;         // indexed by (byte offset / 4)
 };
 
@@ -134,7 +145,28 @@ static std::atomic<int> g_capturing{ -1 };                 // -1 = off, 0 = A, 1
 static ULONGLONG g_cap_start = 0;
 static std::mutex g_cap_mutex;                             // also guards g_status
 
-static void track(uint64_t id, uint64_t buf_size, uint64_t base, const float *f, size_t n)
+static std::string describe(const resource_desc &d)
+{
+    std::string s;
+    auto add = [&](resource_usage f, const char *name) {
+        if ((d.usage & f) == 0)
+            return;
+        if (!s.empty()) s += "|";
+        s += name;
+    };
+    add(resource_usage::constant_buffer, "CB");
+    add(resource_usage::shader_resource, "SRV");
+    add(resource_usage::unordered_access, "UAV");
+    add(resource_usage::vertex_buffer, "VB");
+    add(resource_usage::index_buffer, "IB");
+    char b[32];
+    snprintf(b, sizeof b, " heap=%d", static_cast<int>(d.heap));
+    s += b;
+    return s;
+}
+
+static void track(uint64_t id, const resource_desc &desc, uint64_t base,
+                  const float *f, size_t n, int path)
 {
     std::lock_guard<std::mutex> lock(g_cap_mutex);
     const int which = g_capturing.load();
@@ -150,20 +182,29 @@ static void track(uint64_t id, uint64_t buf_size, uint64_t base, const float *f,
         return;
     }
 
-    if (buf_size > 8192)           // camera/global data lives in small buffers
-        return;
-
     BufTrack &bt = g_cap[which][id];
-    bt.size = buf_size;
+    if (bt.info.empty())
+    {
+        bt.size = desc.buffer.size;
+        bt.info = describe(desc);
+    }
+    bt.writes++;
+    if (path == 0) bt.via_update++; else bt.via_map++;
+
     const size_t first = static_cast<size_t>(base / 4);
     if (bt.locs.size() < first + n)
         bt.locs.resize(first + n);
 
     for (size_t i = 0; i < n; ++i)
     {
+        const float v = f[i];
+        if (!std::isfinite(v))
+            continue;
         Loc &L = bt.locs[first + i];
-        if (!L.seen) { L.seen = true; L.first = f[i]; }
-        else if (!L.varying && fabsf(f[i] - L.first) > 1e-5f) L.varying = true;
+        if (L.n == 0) { L.mn = L.mx = v; }
+        else { if (v < L.mn) L.mn = v; if (v > L.mx) L.mx = v; }
+        L.sum += v;
+        L.n++;
     }
 }
 
@@ -181,13 +222,25 @@ static void start_capture(int which)
 static std::string fmt_loc(const Loc &l)
 {
     char b[32];
-    if (!l.seen)    return "      -- ";
-    if (l.varying)  return "  varies ";
-    snprintf(b, sizeof b, "%9.4f", l.first);
+    if (l.n == 0)
+        return "      --  ";
+    snprintf(b, sizeof b, "%9.4f%c", l.mean(), l.width() > 1e-5f ? '~' : ' ');   // ~ = value jittered
     return b;
 }
 
 static bool near_f(float a, float b) { return fabsf(a - b) <= S.tol; }
+
+// A value counts as "changed" when its range in A and its range in B do not
+// overlap, and the gap between them is much bigger than the wobble inside each.
+static bool changed_loc(const Loc &a, const Loc &b)
+{
+    if (a.n == 0 || b.n == 0)
+        return false;
+    const float gap = std::max(a.mn - b.mx, b.mn - a.mx);
+    if (gap <= 1e-4f)
+        return false;
+    return (a.width() + b.width()) < 0.1f * gap;
+}
 
 static std::string build_diff(std::string &summary)
 {
@@ -199,7 +252,7 @@ static std::string build_diff(std::string &summary)
     };
     std::vector<Entry> entries;
     std::string s;
-    char line[512];
+    char line[640];
     int pos_tags = 0;
 
     std::lock_guard<std::mutex> lock(g_cap_mutex);
@@ -212,11 +265,8 @@ static std::string build_diff(std::string &summary)
         Entry e{ kv.first, &kv.second, &itB->second, {} };
         const size_t n = std::min(e.a->locs.size(), e.b->locs.size());
         for (size_t i = 0; i < n; ++i)
-        {
-            const Loc &la = e.a->locs[i], &lb = e.b->locs[i];
-            if (la.seen && lb.seen && !la.varying && !lb.varying && fabsf(la.first - lb.first) > 1e-4f)
+            if (changed_loc(e.a->locs[i], e.b->locs[i]))
                 e.changed.push_back(i);
-        }
         if (!e.changed.empty())
             entries.push_back(std::move(e));
     }
@@ -225,20 +275,30 @@ static std::string build_diff(std::string &summary)
               [](const Entry &x, const Entry &y) { return x.changed.size() > y.changed.size(); });
 
     snprintf(line, sizeof line,
-             "A: %zu buffers tracked, B: %zu buffers tracked, %zu buffers have values that are "
-             "stable in A and in B but differ between them.\n"
+             "A: %zu buffers tracked, B: %zu buffers tracked, %zu buffers have values whose range "
+             "differs between A and B.\n"
              "Position A = %.3f %.3f %.3f   Position B = %.3f %.3f %.3f   tol %.3f\n"
-             "Each row is one float4 register. Lines tagged <-POS.x/z matched the camera position.\n",
+             "Buffer writes seen: %llu, scanned: %llu, skipped as bigger than %llu B: %llu "
+             "(largest write: %llu B), skipped as non-constant-buffer: %llu (cb_only=%d)\n"
+             "Each row is one float4 register. '~' after a value = it jittered during the capture. "
+             "Tags <-POS.x/y/z matched the camera position.\n",
              g_cap[0].size(), g_cap[1].size(), entries.size(),
-             S.pos[0], S.pos[1], S.pos[2], S.posB[0], S.posB[1], S.posB[2], S.tol);
+             S.pos[0], S.pos[1], S.pos[2], S.posB[0], S.posB[1], S.posB[2], S.tol,
+             (unsigned long long)g_seen.load(), (unsigned long long)g_writes.load(),
+             (unsigned long long)SCAN_CAP, (unsigned long long)g_skip_big.load(),
+             (unsigned long long)g_max_size.load(), (unsigned long long)g_skip_notcb.load(),
+             S.cb_only ? 1 : 0);
     s += line;
 
+    std::set<uint64_t> changed_ids;
     for (size_t k = 0; k < entries.size() && k < 12; ++k)
     {
         const Entry &e = entries[k];
-        snprintf(line, sizeof line, "\n== buffer %s %llu (size %llu bytes): %zu changed values ==\n",
+        changed_ids.insert(e.id);
+        snprintf(line, sizeof line, "\n== buffer %s %llu (size %llu bytes, %s): %zu changed values ==\n",
                  S.group_by_size ? "size-group" : "handle",
-                 (unsigned long long)e.id, (unsigned long long)e.a->size, e.changed.size());
+                 (unsigned long long)e.id, (unsigned long long)e.a->size, e.a->info.c_str(),
+                 e.changed.size());
         s += line;
 
         std::set<size_t> regs;
@@ -260,14 +320,14 @@ static std::string build_diff(std::string &summary)
                 rowA += fmt_loc(la) + " ";
                 rowB += fmt_loc(lb) + " ";
 
-                if (la.seen && lb.seen && !la.varying && !lb.varying)
+                if (la.n > 0 && lb.n > 0)
                 {
                     static const char axes[3] = { 'x', 'y', 'z' };
                     for (int ax = 0; ax < 3; ++ax)
                     {
-                        if (near_f(la.first, S.pos[ax]) && near_f(lb.first, S.posB[ax]))
+                        if (near_f(la.mean(), S.pos[ax]) && near_f(lb.mean(), S.posB[ax]))
                         { tags += " <-POS."; tags += axes[ax]; ++pos_tags; }
-                        else if (near_f(la.first, -S.pos[ax]) && near_f(lb.first, -S.posB[ax]))
+                        else if (near_f(la.mean(), -S.pos[ax]) && near_f(lb.mean(), -S.posB[ax]))
                         { tags += " <-(-POS)."; tags += axes[ax]; ++pos_tags; }
                     }
                 }
@@ -276,6 +336,32 @@ static std::string build_diff(std::string &summary)
                      r * 16, rowA.c_str(), rowB.c_str(), tags.c_str());
             s += line;
         }
+    }
+
+    // ---- census of every tracked buffer ----
+    struct Row { uint64_t id; const BufTrack *a; const BufTrack *b; };
+    std::vector<Row> rows;
+    for (const auto &kv : g_cap[0])
+    {
+        auto itB = g_cap[1].find(kv.first);
+        rows.push_back({ kv.first, &kv.second, itB == g_cap[1].end() ? nullptr : &itB->second });
+    }
+    std::sort(rows.begin(), rows.end(),
+              [](const Row &x, const Row &y) { return x.a->writes > y.a->writes; });
+
+    s += "\n== census: every buffer written during capture A (sorted by writes) ==\n";
+    size_t listed = 0;
+    for (const Row &r : rows)
+    {
+        if (listed++ >= 60) { s += "  ...\n"; break; }
+        snprintf(line, sizeof line,
+                 "  id %-12llu %7llu B  %-28s writes A=%llu (update %llu / map %llu)  B=%llu%s\n",
+                 (unsigned long long)r.id, (unsigned long long)r.a->size, r.a->info.c_str(),
+                 (unsigned long long)r.a->writes, (unsigned long long)r.a->via_update,
+                 (unsigned long long)r.a->via_map,
+                 (unsigned long long)(r.b ? r.b->writes : 0),
+                 changed_ids.count(r.id) ? "   <-- has changed values" : "");
+        s += line;
     }
 
     summary = std::to_string(entries.size()) + " buffers changed, "
@@ -345,18 +431,31 @@ static std::string hits_report()
 }
 
 // ---------------------------------------------------------------------------
-// Buffer write scanning
+// Buffer write scanning (path: 0 = update_buffer_region, 1 = map/unmap)
 // ---------------------------------------------------------------------------
-static void scan(device *dev, resource res, uint64_t base, const void *data, uint64_t size)
+static void scan(device *dev, resource res, uint64_t base, const void *data, uint64_t size, int path)
 {
-    if (data == nullptr || size < 12 || size > 65536)
+    if (data == nullptr || size < 12)
         return;
+
+    g_seen.fetch_add(1, std::memory_order_relaxed);
+    uint64_t prev = g_max_size.load(std::memory_order_relaxed);
+    while (size > prev && !g_max_size.compare_exchange_weak(prev, size)) {}
+
+    if (size > SCAN_CAP)
+    {
+        g_skip_big.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
 
     const resource_desc desc = dev->get_resource_desc(res);
     if (desc.type != resource_type::buffer)
         return;
     if (S.cb_only && (desc.usage & resource_usage::constant_buffer) == 0)
+    {
+        g_skip_notcb.fetch_add(1, std::memory_order_relaxed);
         return;
+    }
 
     g_writes.fetch_add(1, std::memory_order_relaxed);
 
@@ -364,7 +463,7 @@ static void scan(device *dev, resource res, uint64_t base, const void *data, uin
     const size_t n = static_cast<size_t>(size / 4);
 
     if (g_capturing.load() >= 0)
-        track(S.group_by_size ? desc.buffer.size : res.handle, desc.buffer.size, base, f, n);
+        track(S.group_by_size ? desc.buffer.size : res.handle, desc, base, f, n, path);
 
     search_position(desc, base, f, n);
 }
@@ -380,7 +479,7 @@ static bool on_update(device *dev, const void *data, resource dest, uint64_t off
 {
     if (size == UINT64_MAX)   // ReShade 6.7+: "from offset to end of buffer"
         size = dev->get_resource_desc(dest).buffer.size - offset;
-    scan(dev, dest, offset, data, size);
+    scan(dev, dest, offset, data, size, 0);
     return false;
 }
 
@@ -407,7 +506,7 @@ static void on_unmap(device *dev, resource res)
     uint64_t size = mi.size;
     if (size == UINT64_MAX)
         size = dev->get_resource_desc(res).buffer.size - mi.offset;
-    scan(dev, res, mi.offset, mi.ptr, size);
+    scan(dev, res, mi.offset, mi.ptr, size, 1);
 }
 
 static bool key_down(int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; }
@@ -457,8 +556,10 @@ static void draw_overlay(effect_runtime *)
     ImGui::InputFloat3("Camera position B", S.posB, "%.3f");
     ImGui::SliderFloat("Tolerance", &S.tol, 0.001f, 0.1f, "%.3f");
     ImGui::Checkbox("Constant buffers only", &S.cb_only);
-    ImGui::Checkbox("Group buffers by size (try if the diff finds nothing)", &S.group_by_size);
-    ImGui::Text("Buffer writes scanned: %llu", (unsigned long long)g_writes.load());
+    ImGui::Checkbox("Group buffers by size", &S.group_by_size);
+    ImGui::Text("Writes seen: %llu  scanned: %llu  too big: %llu  largest: %llu B",
+                (unsigned long long)g_seen.load(), (unsigned long long)g_writes.load(),
+                (unsigned long long)g_skip_big.load(), (unsigned long long)g_max_size.load());
 
     if (ImGui::Button("Clear position hits"))
     {
