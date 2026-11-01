@@ -13,7 +13,6 @@
 //
 // Build: x64 DLL, C++17 -> compass_probe.addon64 (see build.yml)
 // NOTE: not compiled by the author; event signatures were checked against the
-// ReShade docs. If the compiler complains, send me the error lines.
 
 #define _CRT_SECURE_NO_WARNINGS
 #define WIN32_LEAN_AND_MEAN
