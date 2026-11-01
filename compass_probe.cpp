@@ -244,9 +244,9 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
     case DLL_PROCESS_ATTACH:
         if (!reshade::register_addon(hModule))
             return FALSE;
-        reshade::register_event<addon_event::update_buffer_region>(on_update);
-        reshade::register_event<addon_event::map_buffer_region>(on_map);
-        reshade::register_event<addon_event::unmap_buffer_region>(on_unmap);
+        reshade::register_event<reshade::addon_event::update_buffer_region>(on_update);
+        reshade::register_event<reshade::addon_event::map_buffer_region>(on_map);
+        reshade::register_event<reshade::addon_event::unmap_buffer_region>(on_unmap);
         reshade::register_overlay(nullptr, draw_overlay);
         break;
     case DLL_PROCESS_DETACH:
