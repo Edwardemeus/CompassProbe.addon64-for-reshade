@@ -10,6 +10,7 @@
 // update_buffer_region BEFORE the update), but if the compiler complains,
 // compare the callbacks below with include/reshade_events.hpp.
 
+#define _CRT_SECURE_NO_WARNINGS
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
@@ -171,7 +172,13 @@ static std::string report()
 {
     std::string s;
     char line[256];
+    snprintf(line, sizeof line, "pos %.3f %.3f %.3f  tol %.4f  cb_only %d  writes %llu\n",
+             S.pos[0], S.pos[1], S.pos[2], S.tol, S.cb_only ? 1 : 0,
+             (unsigned long long)g_writes.load());
+    s += line;
     std::lock_guard<std::mutex> lock(g_hits_mutex);
+    if (g_hits.empty())
+        s += "no hits\n";
     for (const auto &kv : g_hits)
     {
         const Hit &h = kv.second;
@@ -192,6 +199,28 @@ static std::string report()
     return s;
 }
 
+static std::string g_saved_path;
+
+// Writes the report to compass_probe_report.txt in the same folder as the exe.
+static void save_report()
+{
+    char path[MAX_PATH] = {};
+    GetModuleFileNameA(nullptr, path, MAX_PATH);
+    std::string p(path);
+    p = p.substr(0, p.find_last_of("\\/") + 1) + "compass_probe_report.txt";
+
+    const std::string text = report();
+    FILE *fp = fopen(p.c_str(), "wb");
+    if (fp != nullptr)
+    {
+        fwrite(text.data(), 1, text.size(), fp);
+        fclose(fp);
+        g_saved_path = p;
+    }
+    else
+        g_saved_path = "FAILED to write " + p;
+}
+
 static void draw_overlay(effect_runtime *)
 {
     ImGui::TextUnformatted("1) Run the Lua command in Studio  2) type the position below  3) keep the camera still");
@@ -207,8 +236,13 @@ static void draw_overlay(effect_runtime *)
         g_hits.clear();
     }
     ImGui::SameLine();
-    if (ImGui::Button("Copy report to clipboard"))
+    if (ImGui::Button("Save report to file"))
+        save_report();
+    ImGui::SameLine();
+    if (ImGui::Button("Copy to clipboard"))
         ImGui::SetClipboardText(report().c_str());
+    if (!g_saved_path.empty())
+        ImGui::TextWrapped("Report saved to: %s", g_saved_path.c_str());
 
     std::lock_guard<std::mutex> lock(g_hits_mutex);
     ImGui::Text("Hits: %zu", g_hits.size());
