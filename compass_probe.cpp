@@ -41,9 +41,9 @@
 
 using namespace reshade::api;
 
-extern "C" __declspec(dllexport) const char *NAME = "Roblox camera probe";
+extern "C" __declspec(dllexport) const char *NAME = "Roblox camera probe v5";
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
-    "Finds the camera data inside Studio's constant buffers (bound-buffer readback A/B diff).";
+    "v5: finds the camera data inside Studio's constant buffers (bound-buffer readback A/B diff).";
 
 // ---------------------------------------------------------------------------
 // Hotkeys: hold Ctrl+Shift, then press the F-key
@@ -732,7 +732,7 @@ static void save_diff()
 {
     std::string summary;
     const std::string text = build_diff(summary);
-    const std::string where = write_next_to_exe("compass_probe_diff.txt", text);
+    const std::string where = write_next_to_exe("compass_probe_v5_diff.txt", text);
     {
         std::lock_guard<std::mutex> lock(g_cap_mutex);
         g_status = "Diff saved: " + summary + " -> " + where;
