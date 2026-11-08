@@ -1,0 +1,33 @@
+name: build-diag
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Only the header files are needed
+      - name: Download ReShade headers
+        shell: pwsh
+        run: git clone --depth 1 https://github.com/crosire/reshade.git reshade-src
+
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Compile
+        shell: pwsh
+        run: cl /nologo /std:c++17 /EHsc /O2 /LD /I reshade-src\include render_diag.cpp /Fe:render_diag.dll user32.lib
+
+      - name: Rename to .addon64
+        shell: pwsh
+        run: Rename-Item render_diag.dll render_diag.addon64
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: render_diag-addon
+          path: render_diag.addon64
